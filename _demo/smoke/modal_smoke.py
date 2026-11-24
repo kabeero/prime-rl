@@ -82,7 +82,7 @@ def main() -> None:
     bundle = {
         "registry": APP, "volume": "poc-work-mkgz", "run_id": "smoke0000000000", "run_name": "smoke",
         "files": {"remote/node.sh": NODE_SH, "inference.json": "{}"}, "node_script": "remote/node.sh",
-        "model_name": sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-0.6B",
+        "model_name": next((arg for arg in sys.argv[1:] if not arg.startswith("--")), "Qwen/Qwen3-0.6B"),
         "tailscale_tag": "tag:prime-rl", "tailscale_version": "1.104.7", "heartbeat_timeout_s": 120,
         "admin_token_var": "PRIME_RL_ADMIN_TOKEN", "agent_port": 8300, "router_port": 8000, "backend_port": 8100,
         "dp_per_node": 1, "env_pools": [],
