@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# msh - tiny wrapper around sandbox.py + the modal CLI for a persistent H200 dev box.
+#
+#   ./msh build                 build/publish the image (once, or after editing sandbox.py)
+#   ./msh up [--gpus N] [--hours H] [--snapshot [ID]] ...
+#   ./msh shell                 attach an interactive shell (re-run any time to re-attach)
+#   ./msh exec 'cmd ...'        run a one-off command in the sandbox
+#   ./msh push <local> [remote] upload into the volume (remote path relative to /mnt/work)
+#   ./msh pull <remote> [local] download from the volume
+#   ./msh snapshot              save root FS (apt installs etc.) as an image; boot with `up --snapshot`
+#   ./msh status | id | down
+#
+#   RDMA gang (clustered Functions, see cluster.py):
+#   ./msh cluster up [--nodes 2] [--region us-central] [--hours 4] [--no-cpu-box]
+#   ./msh cluster ls | test | down
+#   ./msh cluster shell <node0|node1|cpu>
+#   ./msh cluster exec <node0|node1|cpu|all> 'cmd'
+#
+# Env overrides: POC_NAME POC_VOLUME POC_APP POC_IMAGE POC_USER POC_WITH_CUDA13=1
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+py() { uv run --quiet --script "$HERE/sandbox.py" "$@"; }
+cpy() { uv run --quiet --script "$HERE/cluster.py" "$@"; }
+volume() { echo "${POC_VOLUME:-poc-work-${POC_USER:-$(whoami)}}"; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  build|up|id|status|snapshot|down)
+    py "$cmd" "$@"
+    ;;
+  shell|sh)
+    exec modal shell "$(py id)" "$@"
+    ;;
+  exec|x)
+    [[ $# -ge 1 ]] || { echo "usage: msh exec 'command'" >&2; exit 2; }
+    # --cmd is shlex-split, not run through a shell; wrap so pipes/&&/$VARS work
+    exec modal shell "$(py id)" --cmd "bash -lc $(printf %q "$*")"
+    ;;
+  push)
+    [[ $# -ge 1 ]] || { echo "usage: msh push <local> [remote]" >&2; exit 2; }
+    modal volume put --force "$(volume)" "$1" "${2:-/$(basename "$1")}"
+    py reload   # make the upload visible inside a running sandbox
+    ;;
+  pull)
+    [[ $# -ge 1 ]] || { echo "usage: msh pull <remote> [local]" >&2; exit 2; }
+    modal volume get --force "$(volume)" "$1" "${2:-.}"
+    ;;
+  ls)
+    modal volume ls "$(volume)" "${1:-/}"
+    ;;
+  cluster|c)
+    sub="${1:-ls}"; shift || true
+    case "$sub" in
+      shell|sh) exec modal shell "$(cpy id "${1:?target: node0|node1|cpu}")" ;;
+      exec|x)
+        t="${1:?target: node0|node1|cpu|all}"; shift
+        if [[ "$t" == all ]]; then
+          for k in $(cpy ls | awk '{print $1}'); do echo "== $k"; modal container exec "$(cpy id "$k")" bash -lc "$*"; done
+        else
+          exec modal container exec "$(cpy id "$t")" bash -lc "$*"
+        fi ;;
+      *) cpy "$sub" "$@" ;;
+    esac
+    ;;
+  help|-h|--help)
+    awk 'NR>1 && /^set -euo/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2; exit 2
+    ;;
+esac
