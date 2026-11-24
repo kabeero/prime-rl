@@ -51,6 +51,8 @@ orchestrator = "prime_rl.entrypoints.orchestrator:main"
 eval = "prime_rl.entrypoints.eval:main"
 env-worker-pool = "prime_rl.entrypoints.env_worker_pool:main"
 dashboard = "prime_rl.entrypoints.dashboard:main"
+remote-fleet = "prime_rl.entrypoints.remote_fleet:main"
+remote-node-agent = "prime_rl.entrypoints.remote_node_agent:main"
 
 [project.entry-points."vllm.general_plugins"]
 prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
