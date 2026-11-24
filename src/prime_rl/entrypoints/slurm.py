@@ -25,6 +25,15 @@ def load_slurm_template(slurm: SlurmConfig) -> "Template":
     return env.get_template(slurm.template_path.name)
 
 
+def load_bundled_template(name: str) -> "Template":
+    """Load a bundled template that is not a SLURM script of its own."""
+    from jinja2 import Environment, FileSystemLoader
+
+    bundled_templates = find_package_resource("templates")
+    assert bundled_templates is not None
+    return Environment(loader=FileSystemLoader(bundled_templates), keep_trailing_newline=True).get_template(name)
+
+
 def submit_sbatch(script_path: Path, log_message: str) -> None:
     """Submit ``script_path`` with sbatch and exit on failure."""
     logger = get_logger()

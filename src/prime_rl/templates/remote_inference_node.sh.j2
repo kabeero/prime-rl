@@ -1,0 +1,94 @@
+#!/bin/bash
+{#- One node of a remote inference deployment: what an inference node of multi_node_rl.sbatch.j2 runs, on a
+    machine outside the SLURM job. The remote bootstrap runs it with PROJECT_DIR, CONFIG_DIR, LOG_DIR, NODE_RANK,
+    CLUSTER_IPS (the nodes' private addresses, by rank), TAILNET_IP, the run id and name, and the admin token's
+    digest in the environment. #}
+# Remote inference node: the node agent, the env worker pools, the engines and (on node 0) the router.
+set -o pipefail
+
+export NUM_INFER_NODES={{ num_infer_nodes }}
+export NODES_PER_INFER_REPLICA={{ nodes_per_infer_replica }}
+export GPUS_PER_NODE={{ gpus_per_node }}
+export ROUTER_PORT={{ router_port }}
+export INFERENCE_TP={{ inference_tp }}
+export INFERENCE_DP_LOCAL=$((GPUS_PER_NODE / INFERENCE_TP))
+export INFERENCE_DATA_PARALLEL_RPC_PORT={{ inference_data_parallel_rpc_port }}
+export BACKEND_PORT={{ backend_port }}
+export INFERENCE_ENABLE_EXPERT_PARALLEL={{ "1" if inference_enable_expert_parallel else "0" }}
+# The launch helpers name their node-local scratch after the user and the SLURM job.
+export USER=${USER:-$(id -un)}
+export SLURM_JOB_ID=${PRL_RUN_ID:0:12}
+
+# The nodes reach each other, and the env workers reach the router, over the private network.
+INFER_HOSTS=( $CLUSTER_IPS )
+export HOSTNAMES_STR="$CLUSTER_IPS"
+INFER_NODE_RANK=$NODE_RANK
+LOCAL_IP=${INFER_HOSTS[$INFER_NODE_RANK]}
+REPLICA_IDX=0
+RANK_IN_REPLICA=$INFER_NODE_RANK
+ADMIN_URLS=""
+ROUTER_ARGS=""
+{% include '_infer_endpoints.sh.j2' %}
+
+cd $PROJECT_DIR
+source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+ulimit -n 65536
+ulimit -l unlimited
+mkdir -p $LOG_DIR/inference $LOG_DIR/remote
+
+# Only the engines and the node agent check the admin token, so only they get its digest.
+ADMIN_TOKEN_DIGEST=${{ '{' }}{{ admin_token.by_process.inference.checks }}_SHA256}
+unset {{ admin_token.by_process.inference.checks }}_SHA256
+
+(
+    {{ admin_token.by_process.inference.checks }}_SHA256="$ADMIN_TOKEN_DIGEST" exec uv run remote-node-agent @ $CONFIG_DIR/remote/agent.json \
+        > $LOG_DIR/remote/agent.$NODE_RANK.log 2>&1
+) &
+
+    # Inference env vars: launcher defaults + [env_vars] + [inference.env_vars]
+{%- for key, value in inference_env_vars.items() %}
+    export {{ key }}="{{ value }}"
+{%- endfor %}
+{%- if env_pools %}
+
+    # Every node runs a replica of every env worker pool, on a fixed port the orchestrator connects to over
+    # the tailnet. The workers publish their payload servers under the tailnet address and call the router
+    # over the private network. They take the orchestrator env vars.
+{%- for split, name in env_pools %}
+    mkdir -p $LOG_DIR/envs/{{ split }}
+    (
+{%- for key, value in orchestrator_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{%- endfor %}
+        exec uv run env-worker-pool @ $CONFIG_DIR/envs/{{ split }}/{{ name }}.json \
+            --serve.address tcp://0.0.0.0:{{ env_base_port + loop.index0 }} \
+            --serve.advertise-host $TAILNET_IP \
+            --serve.inference-base-url http://${INFER_HOSTS[0]}:$ROUTER_PORT/v1 \
+            --address-file $CONFIG_DIR/envs/{{ split }}/{{ name }}.$INFER_NODE_RANK.address \
+            > $LOG_DIR/envs/{{ split }}/{{ name }}.$INFER_NODE_RANK.log 2>&1
+    ) &
+{%- endfor %}
+{%- endif %}
+
+    echo "INFER_NODE_RANK=$INFER_NODE_RANK LOCAL_IP=$LOCAL_IP TAILNET_IP=$TAILNET_IP" \
+        | tee $LOG_DIR/inference/node_${INFER_NODE_RANK}.log
+
+    CONFIG_PATH="$CONFIG_DIR/inference.json"
+    ADMIN_TOKEN_ENV="{{ admin_token.by_process.inference.checks }}_SHA256=$ADMIN_TOKEN_DIGEST"
+{% include '_launch_rank.sh.j2' %}
+{% include '_launch_router.sh.j2' %}
+
+{% include '_launch_infer_node.sh.j2' %}
+
+# Every process here must outlive the run, so any exit, clean or not, ends the node.
+wait -n -p FINISHED_PID
+EXIT_CODE=$?
+if [ -n "${INFERENCE_PORT_BY_PID[$FINISHED_PID]:-}" ]; then
+    echo "[node $NODE_RANK] inference server on port ${INFERENCE_PORT_BY_PID[$FINISHED_PID]} exited with code $EXIT_CODE"
+else
+    echo "[node $NODE_RANK] process $FINISHED_PID exited with code $EXIT_CODE"
+fi
+for pid in $(jobs -p); do
+    kill -TERM $pid 2>/dev/null || true
+done
+exit 1

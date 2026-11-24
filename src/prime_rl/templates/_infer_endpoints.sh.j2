@@ -1,0 +1,11 @@
+{# Engine endpoints of a regular (non-disaggregated) inference deployment, included by the
+   SLURM template and the remote node template. Reads INFER_HOSTS, NUM_INFER_NODES,
+   INFERENCE_DP_LOCAL and BACKEND_PORT. -#}
+# External-LB: one endpoint per DP rank (BACKEND_PORT + dp_local) on each node.
+for ((n=0; n<NUM_INFER_NODES; n++)); do
+    host="${INFER_HOSTS[$n]}"
+    for ((k=0; k<INFERENCE_DP_LOCAL; k++)); do
+        ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:$((BACKEND_PORT + k))/v1"
+        ROUTER_ARGS="$ROUTER_ARGS http://${host}:$((BACKEND_PORT + k))"
+    done
+done

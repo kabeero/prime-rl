@@ -96,6 +96,7 @@ def format_log_message(
     env_names: dict[str, list[str]] | None = None,
     num_train_nodes: int = 1,
     num_infer_nodes: int = 0,
+    remote: bool = False,
 ) -> str:
     """Format a log message showing where to find all log files."""
     col = 18
@@ -120,6 +121,8 @@ def format_log_message(
         log_lines.append(f"{i1}{'Inference:':<{col}}tail -F {log_dir}/inference.log")
         if num_infer_nodes > 1:
             log_lines.append(f"{i2}{'All nodes:':<{col - 1}}tail -F {log_dir}/inference/node_*.log")
+    if remote:
+        log_lines.append(f"{i1}{'Remote fleet:':<{col}}tail -F {log_dir}/remote/fleet.log")
     # Env worker pools, by split (``envs/<split>/<name>.log``); one split lists its envs
     # directly, several list them under the split.
     splits = {split: names for split, names in (env_names or {}).items() if names}

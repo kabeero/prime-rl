@@ -11,6 +11,13 @@ from urllib.parse import urlparse
 from prime_rl.configs.algorithm import FrozenModelConfig
 from prime_rl.configs.inference import VllmRouterConfig
 from prime_rl.configs.orchestrator import EnvConfig
+from prime_rl.configs.remote import (
+    REMOTE_FLEET_CONFIG,
+    REMOTE_NODE_SCRIPT,
+    RemoteEnvPoolConfig,
+    RemoteFleetConfig,
+    remote_app_name,
+)
 from prime_rl.configs.rl import RLConfig
 from prime_rl.entrypoints.dashboard import ensure_dashboard, log_run_links, run_links
 from prime_rl.entrypoints.inference import (
@@ -19,7 +26,7 @@ from prime_rl.entrypoints.inference import (
     vllm_overrides_fragment,
     write_pd_configs,
 )
-from prime_rl.entrypoints.slurm import load_slurm_template, submit_sbatch
+from prime_rl.entrypoints.slurm import load_bundled_template, load_slurm_template, submit_sbatch
 from prime_rl.utils.admin_token import AdminTokenUses, TokenUse
 from prime_rl.utils.config import check_mode, cli, dump_resolved_config, dump_rl_components
 from prime_rl.utils.logger import get_logger, setup_logger
@@ -98,17 +105,20 @@ def rl_config_components(config: RLConfig, config_dir: Path) -> list[tuple[str, 
 
 def admin_token_uses(config: RLConfig) -> AdminTokenUses:
     """The orchestrator calls the engines' admin routes, so it gets the token; the inference
-    server and the control APIs only check it, so they get its digest."""
-    return AdminTokenUses(
-        {
-            "inference": TokenUse(checks=config.inference.server.admin_token_var if config.inference else None),
-            "orchestrator": TokenUse(
-                sends=config.orchestrator.model.client.admin_token_var,
-                checks=config.orchestrator.control.admin_token_var if config.orchestrator.control else None,
-            ),
-            "trainer": TokenUse(checks=config.trainer.control.admin_token_var if config.trainer.control else None),
-        }
-    )
+    server and the control APIs only check it, so they get its digest. With remote inference
+    the fleet manager calls the node agents, which check the engines' token."""
+    uses = {
+        "inference": TokenUse(checks=config.inference.server.admin_token_var if config.inference else None),
+        "orchestrator": TokenUse(
+            sends=config.orchestrator.model.client.admin_token_var,
+            checks=config.orchestrator.control.admin_token_var if config.orchestrator.control else None,
+        ),
+        "trainer": TokenUse(checks=config.trainer.control.admin_token_var if config.trainer.control else None),
+    }
+    if config.remote_inference:
+        assert config.inference is not None
+        uses["fleet"] = TokenUse(sends=config.inference.server.admin_token_var)
+    return AdminTokenUses(uses)
 
 
 def wait_for_port(host: str, port: int, processes: ProcessGroup, name: str, timeout: float) -> None:
@@ -198,6 +208,95 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
     for split, source in env_worker_pools(config):
         store_dir = ROLLOUT_STORE_DIR if retain and split == "train" else None
         write_env_worker_pool_config(output_dir, split, source, config.orchestrator.log, store_dir)
+
+
+def inference_template_vars(config: RLConfig) -> dict[str, Any]:
+    """What the templates of a regular (non-disaggregated) multi-node inference deployment read."""
+    inference = config.inference
+    return dict(
+        is_disaggregated=False,
+        num_infer_nodes=config.deployment.total_infer_nodes,
+        nodes_per_infer_replica=config.deployment.infer_nodes_per_replica,
+        num_infer_replicas=config.deployment.num_infer_replicas,
+        gpus_per_node=config.deployment.gpus_per_node,
+        router=inference.router if inference else VllmRouterConfig(),
+        router_port=inference.server.port if inference else 8000,
+        infer_nodes_per_replica=config.deployment.infer_nodes_per_replica,
+        backend_port=inference.backend_port if inference else 8100,
+        inference_tp=inference.vllm.tensor_parallel_size if inference else 1,
+        inference_enable_expert_parallel=inference.vllm.enable_expert_parallel if inference else False,
+        inference_data_parallel_rpc_port=inference.vllm.data_parallel_rpc_port if inference else 29600,
+        dp_per_node=(config.deployment.gpus_per_node // inference.vllm.tensor_parallel_size) if inference else 1,
+        orchestrator_env_vars={**DEFAULT_COMMON_ENV_VARS, **config.env_vars, **config.orchestrator.env_vars},
+        inference_env_vars=(
+            {**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars, **inference.env_vars}
+            if inference
+            else {}
+        ),
+        train_env_names=env_worker_pool_names(config, "train"),
+        eval_env_names=env_worker_pool_names(config, "eval"),
+        admin_token=admin_token_uses(config),
+    )
+
+
+def write_remote_fleet(config: RLConfig, config_dir: Path, log_dir: Path) -> None:
+    """Write what the fleet manager of a remote inference deployment runs from: its config, and
+    the script each remote node runs (the SLURM template's inference node, for another machine)."""
+    assert config.inference is not None and config.inference.deployment.type == "remote"
+    assert config.slurm is not None
+    deployment = config.inference.deployment
+    template_vars = inference_template_vars(config)
+    fleet = RemoteFleetConfig(
+        run_name=config.run.name,
+        app_name=remote_app_name(config.run.name),
+        project_dir=config.slurm.project_dir,
+        config_dir=config_dir,
+        log_dir=log_dir,
+        launcher_dir=get_launcher_dir(config.run_dir),
+        deployment=deployment,
+        num_nodes=config.deployment.total_infer_nodes,
+        num_home_nodes=config.deployment.num_train_nodes,
+        gpus_per_node=config.deployment.gpus_per_node,
+        dp_per_node=template_vars["dp_per_node"],
+        router_port=config.inference.server.port,
+        backend_port=config.inference.backend_port,
+        env_pools=[
+            RemoteEnvPoolConfig(split=split, name=source.resolved_name) for split, source in env_worker_pools(config)
+        ],
+        model_name=config.inference.vllm.model,
+        admin_token_var=config.inference.server.admin_token_var,
+        log=config.orchestrator.log,
+    )
+    (config_dir / REMOTE_FLEET_CONFIG).write_text(json.dumps(dump_resolved_config(fleet), indent=2))
+    script = load_bundled_template("remote_inference_node.sh.j2").render(
+        **template_vars,
+        env_pools=[(pool.split, pool.name) for pool in fleet.env_pools],
+        env_base_port=deployment.env_base_port,
+    )
+    script_path = config_dir / REMOTE_NODE_SCRIPT
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(script)
+
+
+REMOTE_SECRETS = ["TS_OAUTH_CLIENT_ID", "TS_OAUTH_CLIENT_SECRET"]
+
+
+def check_remote_secrets(config: RLConfig) -> None:
+    """Fail at submit time when a credential the remote inference deployment needs is missing
+    from both the environment and the project's ``.env``, which the job sources."""
+    from dotenv import dotenv_values
+
+    assert config.inference is not None and config.inference.deployment.type == "remote"
+    assert config.slurm is not None
+    available = {**dotenv_values(config.slurm.project_dir / ".env"), **os.environ}
+    missing = [name for name in [*REMOTE_SECRETS, *config.inference.deployment.forward_env] if not available.get(name)]
+    if missing:
+        raise ValueError(f"Remote inference needs {missing} in the environment or in {config.slurm.project_dir}/.env.")
+    if config.inference.deployment.provider.type == "modal":
+        from modal.config import config as modal_config
+
+        if not (modal_config.get("token_id") and modal_config.get("token_secret")):
+            raise ValueError("Remote inference on Modal needs MODAL_TOKEN_ID and MODAL_TOKEN_SECRET, or ~/.modal.toml.")
 
 
 def rl_local(config: RLConfig):
@@ -441,6 +540,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             num_train_nodes=config.deployment.num_train_nodes,
             num_infer_nodes=infer_deploy.num_nodes * config.deployment.num_infer_replicas,
+            num_local_infer_nodes=infer_deploy.num_nodes * config.deployment.num_infer_replicas,
             nodes_per_infer_replica=infer_deploy.num_nodes,
             num_infer_replicas=config.deployment.num_infer_replicas,
             num_prefill_nodes=infer_deploy.num_prefill_nodes,
@@ -479,9 +579,10 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             **modelexpress_vars,
         )
     else:
+        remote = config.remote_inference
         script = template.render(
             **config.slurm.template_vars,
-            is_disaggregated=False,
+            **inference_template_vars(config),
             run_name=config.run.name,
             config_dir=config_dir,  # TODO: should prob have each subconfig path separately
             log_dir=log_dir,
@@ -490,35 +591,17 @@ def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script
             launcher_dir=get_launcher_dir(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
             num_train_nodes=config.deployment.num_train_nodes,
-            num_infer_nodes=config.deployment.total_infer_nodes,
-            nodes_per_infer_replica=config.deployment.infer_nodes_per_replica,
-            num_infer_replicas=config.deployment.num_infer_replicas,
-            gpus_per_node=config.deployment.gpus_per_node,
-            router=config.inference.router if config.inference else VllmRouterConfig(),
-            router_port=config.inference.server.port if config.inference else 8000,
-            infer_nodes_per_replica=config.deployment.infer_nodes_per_replica,
-            backend_port=config.inference.backend_port if config.inference else 8100,
-            inference_tp=config.inference.vllm.tensor_parallel_size if config.inference else 1,
-            inference_enable_expert_parallel=config.inference.vllm.enable_expert_parallel
-            if config.inference
-            else False,
-            inference_data_parallel_rpc_port=config.inference.vllm.data_parallel_rpc_port
-            if config.inference
-            else 29600,
-            dp_per_node=(config.deployment.gpus_per_node // config.inference.vllm.tensor_parallel_size)
-            if config.inference
-            else 1,
+            num_local_infer_nodes=0 if remote else config.deployment.total_infer_nodes,
+            remote_inference=remote,
+            remote_app_name=remote_app_name(config.run.name),
+            tailscale=config.inference.deployment.tailscale if remote else None,
+            forward_env=config.inference.deployment.forward_env if remote else [],
             **mooncake_vars,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             use_zmq_transport=config.rollout_transport is not None and config.rollout_transport.type == "zmq",
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
             orchestrator_on_inference=config.deployment.orchestrator_on_inference,
             trainer_env_vars=trainer_env_vars,
-            orchestrator_env_vars=orchestrator_env_vars,
-            inference_env_vars=inference_env_vars,
-            train_env_names=train_env_names,
-            eval_env_names=eval_env_names,
-            admin_token=admin_token_uses(config),
             **modelexpress_vars,
         )
 
@@ -556,6 +639,10 @@ def rl_slurm(config: RLConfig):
         # It keeps [slurm], which multi-node needs, so it drops the copy in [inference].
         write_config(config, config_dir, exclude={"dry_run": True, "clean": True, "inference": {"slurm"}})
         write_subconfigs(config, config_dir)
+        if config.remote_inference:
+            write_remote_fleet(config, config_dir, log_dir)
+            if not config.dry_run:
+                check_remote_secrets(config)
         components = [("RL", config_dir / RL_CONFIG), *rl_config_components(config, config_dir)]
         logger.info(f"Configs:\n{format_config_message(config_dir, 'rl', components)}")
 
@@ -571,6 +658,7 @@ def rl_slurm(config: RLConfig):
             env_names={"train": train_env_names, "eval": eval_env_names},
             num_train_nodes=config.deployment.num_train_nodes,
             num_infer_nodes=config.deployment.total_infer_nodes if has_infer else 0,
+            remote=config.remote_inference,
         )
 
     script_path = get_launcher_dir(config.run_dir) / RL_SBATCH
