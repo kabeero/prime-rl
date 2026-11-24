@@ -71,3 +71,30 @@ class RemoteFleetConfig(BaseConfig):
     """Socket of this node's ``tailscaled``, for the network checks. Set by the launcher."""
 
     log: LogConfig = LogConfig()
+
+
+class RemoteNodeAgentConfig(BaseConfig):
+    """``uv run remote-node-agent``: runs on every remote inference node, next to the processes it reports on.
+    Written by the remote bootstrap."""
+
+    rank: int
+    host: str = "0.0.0.0"
+    port: int
+
+    tailnet_ip: str
+    cluster_ip: str
+
+    log_dir: Path
+    """The node's log dir, which the fleet manager mirrors."""
+
+    heartbeat_file: Path
+    """Touched on every heartbeat. The bootstrap's watchdog reads its modification time."""
+
+    admin_token_var: str
+    """The agent checks requests against ``$<var>_SHA256`` and refuses to start without it."""
+
+    http_services: dict[str, str] = {}
+    """Name to health URL of every engine (and the router) on this node."""
+
+    address_files: dict[str, Path] = {}
+    """Name to address file of every env worker pool on this node. A pool is up once it has published."""
