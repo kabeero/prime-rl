@@ -55,6 +55,8 @@ WORKER_EXTENSION_CLS = {
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
     "nixl": "prime_rl.inference.vllm.worker.nixl.NIXLWeightUpdateWorker",
     "modelexpress": "prime_rl.inference.vllm.worker.modelexpress.ModelExpressWeightUpdateWorker",
+    # A remote engine loads each version from the node-local directory its node agent staged.
+    "remote": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
 }
 
 

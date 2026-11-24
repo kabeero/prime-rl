@@ -329,6 +329,11 @@ class RLConfig(BaseConfig):
         dynamo = self.orchestrator.model.client.dynamo
         if dynamo is not None and dynamo.enabled:
             raise ValueError("Remote inference does not support Dynamo.")
+        if self.trainer.model.init.type == "scratch" or self.resume is not None:
+            raise ValueError(
+                "Remote inference keeps serving the weights it launched with (weight updates are not implemented): "
+                "the run must start from pretrained weights (model.init.type) and cannot resume."
+            )
         external = [f"{split}/{name}" for (split, name), address in self.orchestrator.env_addresses.items() if address]
         if external:
             raise ValueError(

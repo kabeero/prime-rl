@@ -47,6 +47,10 @@ def setup_weight_sender(
         if model_name is None:
             raise ValueError("modelexpress requires model_name")
         return ModelExpressWeightSender(output_dir, config, model_name=model_name)
+    elif config.type == "remote":
+        from prime_rl.transports.weights.remote import RemoteStartupOnlySender
+
+        return RemoteStartupOnlySender(output_dir, config)
     else:
         raise ValueError(f"Invalid weight broadcast type: {config.type}")
 
@@ -69,5 +73,9 @@ def setup_weight_receiver(
         from prime_rl.transports.weights.modelexpress import ModelExpressWeightReceiver
 
         return ModelExpressWeightReceiver(broadcast_dir, config, admin_plane, model_name)
+    elif config.type == "remote":
+        from prime_rl.transports.weights.remote import RemoteStartupOnlyReceiver
+
+        return RemoteStartupOnlyReceiver(broadcast_dir, config, admin_plane, model_name)
     else:
         raise ValueError(f"Invalid weight broadcast type: {config.type}")

@@ -1824,6 +1824,8 @@ def test_remote_inference_resolves():
         ({"weight_broadcast": {"type": "nccl"}}, "requires weight_broadcast.type = 'remote'"),
         ({"rollout_transport": {"type": "filesystem", "retain": True}, "ckpt": {"interval": 1}}, "retain"),
         ({"trainer.model.lora": {}}, "LoRA"),
+        ({"model": {"init": {"type": "scratch"}}}, "must start from pretrained weights"),
+        ({"resume": {"step": 3}}, "cannot resume"),
         ({"inference.router": {"type": "llm-d"}}, "llm-d"),
         ({"inference.vllm": {"speculative_config": {"model": "draft"}}}, "speculative decoding"),
         ({"orchestrator.model.client.dynamo": {"enabled": True, "discovery_url": "http://x"}}, "Dynamo"),
