@@ -44,6 +44,15 @@ class ServeConfig(BaseConfig):
     max_concurrent: int | None = Field(None, ge=1)
     """Episodes in flight per worker (None = unbounded). How many agent runs one episode
     carries is the env's own (`--env.max-concurrent-agents`, one at a time by default)."""
+    advertise_host: str | None = None
+    """Host under which other machines reach this pool's workers. When set, each worker's
+    payload server binds every interface and publishes this host instead of the one it
+    derives from `address`. For pools whose routable address is not a local interface
+    address (a userspace VPN)."""
+    inference_base_url: str | None = None
+    """Inference URL the workers use instead of the `base_url` each request carries. For
+    pools that reach the inference server on a different address than the orchestrator
+    does."""
 
 
 class EnvWorkerPoolConfig(BaseConfig):

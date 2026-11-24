@@ -277,6 +277,9 @@ class SupervisedTrainerConfig(BaseTrainerConfig):
                     stacklevel=2,
                 )
 
+        if self.inference is not None and self.inference.deployment.type == "remote":
+            raise ValueError("inference.deployment.type = 'remote' is only supported by the rl entrypoint.")
+
         # A scratch init reaches the server with the trainer's startup broadcast.
         if self.inference is not None:
             setup_dummy_load(self.inference, self.model.init.type == "scratch")
@@ -287,8 +290,10 @@ class SupervisedTrainerConfig(BaseTrainerConfig):
             else:
                 self.weight_broadcast = NCCLWeightBroadcastConfig()
         if self.weight_broadcast.type != "filesystem":
-            if self.weight_broadcast.type in ("nixl", "modelexpress"):
-                raise ValueError("NIXL and ModelExpress weight broadcast are not supported for SFT online evals.")
+            if self.weight_broadcast.type in ("nixl", "modelexpress", "remote"):
+                raise ValueError(
+                    "NIXL, ModelExpress and remote weight broadcast are not supported for SFT online evals."
+                )
             if self.model.lora is not None:
                 raise ValueError(
                     "LoRA training is not yet supported with in-memory weight broadcast. "

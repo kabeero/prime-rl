@@ -208,7 +208,7 @@ class VllmConfig(BaseConfig):
 
 
 class WeightBroadcastConfig(BaseConfig):
-    type: Literal["nccl", "filesystem", "nixl", "modelexpress"] = "filesystem"
+    type: Literal["nccl", "filesystem", "nixl", "modelexpress", "remote"] = "filesystem"
     """Weight broadcast transport."""
 
 
@@ -495,8 +495,80 @@ class DisaggregatedInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
         return self.num_prefill_nodes + self.num_decode_nodes
 
 
+class ModalProviderConfig(BaseConfig):
+    """Run the remote nodes as one clustered Modal function."""
+
+    type: Literal["modal"] = "modal"
+
+    image: str
+    """Modal named image (``modal.Image.from_name``) the nodes run."""
+
+    gpu: str = "H200"
+    """Modal GPU type. Each node requests ``deployment.gpus_per_node`` of them."""
+
+    rdma: bool = True
+    """Request an RDMA cluster network between the nodes."""
+
+    efa_disabled: bool = True
+    """Pass Modal's ``efa_disabled`` experimental option."""
+
+    region: str | None = "us-central"
+    """Modal region. None lets Modal place the nodes."""
+
+    volume: str
+    """Modal volume holding the uv and Hugging Face caches, mounted at ``/mnt/work``. ``{user}`` expands to the
+    submitting user's name."""
+
+    timeout_s: int = Field(86400, ge=60, le=86400)
+    """Lifetime cap of the remote nodes. Modal's maximum is 24 hours."""
+
+
+class TailscaleConfig(BaseConfig):
+    """The tailnet that connects the SLURM nodes with the remote nodes. Credentials come from
+    ``TS_OAUTH_CLIENT_ID`` / ``TS_OAUTH_CLIENT_SECRET``."""
+
+    tag: str = Field("tag:prime-rl", pattern=r"^tag:[A-Za-z0-9-]+$")
+    """Tag every node of the run joins under. The OAuth client must own it."""
+
+    version: str = Field("1.104.7", pattern=r"^\d+\.\d+\.\d+$")
+    """Tailscale version downloaded where the ``tailscale`` binaries are missing."""
+
+    require_direct: bool = False
+    """Fail the bring-up when the path between the datacenters is relayed (DERP) instead of direct. False only
+    warns."""
+
+
+# Inference and env worker pools in another datacenter than the trainer. Only ``rl`` runs it; the number of
+# remote nodes is ``deployment.num_infer_nodes``.
+class RemoteInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
+    type: Literal["remote"] = "remote"
+
+    provider: ModalProviderConfig
+    """Where the remote nodes run."""
+
+    tailscale: TailscaleConfig = TailscaleConfig()
+
+    bringup_timeout_s: int = Field(3600, ge=1)
+    """Seconds the remote nodes have to become healthy: engines, router and env worker pools."""
+
+    heartbeat_timeout_s: int = Field(600, ge=60)
+    """Seconds without a heartbeat from the home side after which the remote nodes shut down."""
+
+    env_base_port: int = 7000
+    """Port of the first env worker pool on each remote node; pool ``i`` listens on ``env_base_port + i``."""
+
+    agent_port: int = 8300
+    """Port of the node agent on each remote node."""
+
+    forward_env: list[str] = []
+    """Names of environment variables (from the environment or ``.env``) passed to the remote env worker pools."""
+
+
 InferenceDeploymentConfig: TypeAlias = Annotated[
-    SingleNodeInferenceDeploymentConfig | MultiNodeInferenceDeploymentConfig | DisaggregatedInferenceDeploymentConfig,
+    SingleNodeInferenceDeploymentConfig
+    | MultiNodeInferenceDeploymentConfig
+    | DisaggregatedInferenceDeploymentConfig
+    | RemoteInferenceDeploymentConfig,
     Field(discriminator="type"),
 ]
 
@@ -565,8 +637,22 @@ class InferenceConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_multi_node_requires_slurm(self):
-        if self.deployment.type in ("multi_node", "disaggregated") and self.slurm is None:
-            raise ValueError("Must use SLURM for multi-node / disaggregated deployment.")
+        if self.deployment.type in ("multi_node", "disaggregated", "remote") and self.slurm is None:
+            raise ValueError("Must use SLURM for multi-node / disaggregated / remote deployment.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_remote_deployment(self):
+        if self.deployment.type != "remote":
+            return self
+        if self.router is not None and self.router.type == "llm-d":
+            raise ValueError("Remote inference does not support the llm-d router backend. Use 'vllm-router'.")
+        if self.vllm.enable_lora:
+            raise ValueError("Remote inference does not support LoRA.")
+        if (self.vllm.model_extra or {}).get("speculative_config") is not None:
+            raise ValueError("Remote inference does not support speculative decoding.")
+        if self.kv_cache_offload is not None and self.kv_cache_offload.type == "mooncake":
+            raise ValueError("Remote inference does not support Mooncake KV offload. Use type = 'native'.")
         return self
 
     @model_validator(mode="after")
@@ -611,8 +697,10 @@ class InferenceConfig(BaseConfig):
         """The llm-d router (EPP + Envoy) is launched by the SLURM templates only; multi-node deployments need a router to front the per-rank engines."""
         if self.router is not None and self.router.type == "llm-d" and self.deployment.type == "single_node":
             raise ValueError("The llm-d router backend requires a multi-node or disaggregated SLURM deployment.")
-        if self.router is None and self.deployment.type in ("multi_node", "disaggregated"):
-            raise ValueError("Multi-node / disaggregated deployments require a router fronting the per-rank engines.")
+        if self.router is None and self.deployment.type in ("multi_node", "disaggregated", "remote"):
+            raise ValueError(
+                "Multi-node / disaggregated / remote deployments require a router fronting the per-rank engines."
+            )
         return self
 
     @model_validator(mode="after")

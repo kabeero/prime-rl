@@ -160,6 +160,8 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, log_dir: Path
 def inference_slurm(config: InferenceConfig):
     """Run inference via SLURM."""
     assert config.slurm is not None
+    if config.deployment.type == "remote":
+        raise ValueError("inference.deployment.type = 'remote' is only supported by the rl entrypoint.")
 
     logger = setup_logger(config.log.level, json_logging=config.log.json_logging)
 

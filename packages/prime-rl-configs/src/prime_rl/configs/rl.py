@@ -15,6 +15,7 @@ from prime_rl.configs.shared import (
     EnvVars,
     FileSystemWeightBroadcastConfig,
     NCCLWeightBroadcastConfig,
+    RemoteWeightBroadcastConfig,
     ResumeConfig,
     RunConfig,
     SlurmConfig,
@@ -254,6 +255,12 @@ class RLConfig(BaseConfig):
         if self.deployment.type != "multi_node":
             return self
 
+        if self.inference is not None and self.inference.deployment.type == "remote":
+            # Remote nodes are not part of the allocation, so nothing sizes them but this field.
+            if not self.deployment.num_infer_nodes:
+                raise ValueError("Remote inference requires deployment.num_infer_nodes >= 1 (the remote node count).")
+            return self
+
         if self.inference is None:
             inferred_nodes = 0
         elif self.inference.deployment.type == "multi_node":
@@ -294,6 +301,39 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+        return self
+
+    @property
+    def remote_inference(self) -> bool:
+        """Whether inference and the env worker pools run in another datacenter."""
+        return self.inference is not None and self.inference.deployment.type == "remote"
+
+    @model_validator(mode="after")
+    def validate_remote_inference(self):
+        if not self.remote_inference:
+            return self
+        if self.deployment.type != "multi_node":
+            raise ValueError("Remote inference requires deployment.type = 'multi_node'.")
+        if self.deployment.num_infer_replicas != 1:
+            raise ValueError("Remote inference supports a single inference replica (deployment.num_infer_replicas).")
+        if self.deployment.orchestrator_on_inference:
+            raise ValueError(
+                "Remote inference runs the orchestrator on trainer node 0; unset deployment.orchestrator_on_inference."
+            )
+        if self.orchestrator.speculative_decoding is not None:
+            raise ValueError("Remote inference does not support speculative decoding.")
+        if self.trainer.model.lora is not None:
+            raise ValueError("Remote inference does not support LoRA.")
+        if self.trainer.rollout_transport.retain:
+            raise ValueError("Remote inference does not support rollout_transport.retain.")
+        dynamo = self.orchestrator.model.client.dynamo
+        if dynamo is not None and dynamo.enabled:
+            raise ValueError("Remote inference does not support Dynamo.")
+        external = [f"{split}/{name}" for (split, name), address in self.orchestrator.env_addresses.items() if address]
+        if external:
+            raise ValueError(
+                f"Remote inference starts every env worker pool on the remote nodes; unset serve.address on {external}."
+            )
         return self
 
     ### Auto-setup shared configs (before sub-config construction)
@@ -451,6 +491,16 @@ class RLConfig(BaseConfig):
         trainer cannot rejoin an in-memory transfer group).
         """
         retain = self.trainer.rollout_transport.retain
+        if self.remote_inference:
+            if self.weight_broadcast is None:
+                self.weight_broadcast = RemoteWeightBroadcastConfig()
+            elif self.weight_broadcast.type != "remote":
+                raise ValueError(
+                    f"Remote inference requires weight_broadcast.type = 'remote', got '{self.weight_broadcast.type}': "
+                    "the trainer and the inference nodes share no filesystem or cluster network."
+                )
+        elif self.weight_broadcast is not None and self.weight_broadcast.type == "remote":
+            raise ValueError("weight_broadcast.type = 'remote' requires inference.deployment.type = 'remote'.")
         if self.weight_broadcast is None:
             if self.trainer.model.lora is not None or self.inference is None or retain:
                 self.weight_broadcast = FileSystemWeightBroadcastConfig()

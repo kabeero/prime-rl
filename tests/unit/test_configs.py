@@ -1779,3 +1779,71 @@ def test_score_centering_replays_top_p_alone():
     assert sampling.top_k == 10000 and sampling.logprobs == 1
     assert sampling.extra_body["extra_args"]["prl_replay"]
     assert config.inference.enable_return_sampling_mask
+
+
+def _remote_rl_config(**overrides) -> dict:
+    config = {
+        "trainer": {},
+        "orchestrator": {},
+        "inference": {
+            "deployment": {"type": "remote", "provider": {"type": "modal", "image": "img", "volume": "vol"}},
+        },
+        "deployment": {"type": "multi_node", "num_train_nodes": 1, "num_infer_nodes": 2},
+        "slurm": {},
+    }
+    for path, value in overrides.items():
+        *parents, leaf = path.split(".")
+        target = config
+        for parent in parents:
+            target = target.setdefault(parent, {})
+        target[leaf] = value
+    return config
+
+
+def test_remote_inference_resolves():
+    config = RLConfig.model_validate(_remote_rl_config())
+    assert config.remote_inference
+    assert config.weight_broadcast.type == "remote"
+    assert config.trainer.weight_broadcast.type == "remote"
+    assert config.orchestrator.weight_broadcast.type == "remote"
+    assert config.inference.weight_broadcast.type == "remote"
+    assert config.deployment.total_infer_nodes == 2
+    assert config.orchestrator.env_worker_pool_replicas == 2
+    # Each remote node runs one engine per TP group, like a multi-node inference node.
+    assert config.inference.vllm.data_parallel_size_local == 8
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"deployment.num_infer_nodes": None}, "requires deployment.num_infer_nodes"),
+        ({"deployment.num_infer_nodes": 0}, "requires deployment.num_infer_nodes"),
+        ({"deployment.num_infer_replicas": 2}, "single inference replica"),
+        ({"deployment.orchestrator_on_inference": True}, "orchestrator on trainer node 0"),
+        ({"weight_broadcast": {"type": "filesystem"}}, "requires weight_broadcast.type = 'remote'"),
+        ({"weight_broadcast": {"type": "nccl"}}, "requires weight_broadcast.type = 'remote'"),
+        ({"rollout_transport": {"type": "filesystem", "retain": True}, "ckpt": {"interval": 1}}, "retain"),
+        ({"trainer.model.lora": {}}, "LoRA"),
+        ({"inference.router": {"type": "llm-d"}}, "llm-d"),
+        ({"inference.vllm": {"speculative_config": {"model": "draft"}}}, "speculative decoding"),
+        ({"orchestrator.model.client.dynamo": {"enabled": True, "discovery_url": "http://x"}}, "Dynamo"),
+        (
+            {
+                "orchestrator.train.source": [
+                    {"env": {"taskset": {"id": "reverse-text"}}, "serve": {"address": "tcp://h:1"}}
+                ]
+            },
+            "unset serve.address",
+        ),
+    ],
+)
+def test_remote_inference_rejects(overrides: dict, match: str):
+    with pytest.raises(ValidationError, match=match):
+        RLConfig.model_validate(_remote_rl_config(**overrides))
+
+
+def test_remote_weight_broadcast_needs_remote_inference():
+    config = _remote_rl_config(weight_broadcast={"type": "remote"})
+    config["inference"] = {}
+    with pytest.raises(ValidationError, match="requires inference.deployment.type = 'remote'"):
+        RLConfig.model_validate(config)

@@ -99,11 +99,42 @@ class ModelExpressWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     """Number of receiver buffers. Two overlap the next read with installation."""
 
 
+class RemoteWeightBroadcastConfig(BaseWeightBroadcastConfig):
+    """Weight transfer to inference in another datacenter, through an S3-compatible object store. Set by ``rl``
+    for ``inference.deployment.type = "remote"``; only that deployment supports it."""
+
+    type: Literal["remote"] = "remote"
+
+    store: Literal["s3"] = "s3"
+    """Object store API."""
+
+    endpoint_url: str = "https://storage.us-central1.nebius.cloud"
+    """Object store endpoint."""
+
+    region: str = "us-central1"
+    """Object store region."""
+
+    uri: str | None = Field(None, pattern=r"^s3://[^/]+(/.*)?$")
+    """``s3://<bucket>/<prefix>`` under which each broadcast is stored."""
+
+    credentials_env_prefix: str = "NEBIUS"
+    """Prefix of the environment variables holding the access key: ``<prefix>_ACCESS_KEY_ID`` and
+    ``<prefix>_SECRET_ACCESS_KEY``. The key is passed to the client explicitly; ``AWS_*`` variables and
+    ``~/.aws`` are not read."""
+
+    multipart_chunk_mb: int = Field(128, ge=5)
+    """Multipart part size in MiB."""
+
+    max_concurrency: int = Field(32, ge=1)
+    """Concurrent part transfers per trainer rank and per remote node."""
+
+
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig
     | NCCLWeightBroadcastConfig
     | NIXLWeightBroadcastConfig
-    | ModelExpressWeightBroadcastConfig,
+    | ModelExpressWeightBroadcastConfig
+    | RemoteWeightBroadcastConfig,
     Field(discriminator="type"),
 ]
 """Weight transfer from trainer to inference. ``rl`` copies its ``[weight_broadcast]`` to the trainer and orchestrator."""
@@ -269,6 +300,9 @@ class ClientConfig(BaseClientConfig):
 
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in multi-replica or disaggregated P/D deployments where the router must not handle admin traffic."""
+
+    agent_urls: list[str] | None = None
+    """Base URLs of the node agents of a remote inference deployment, one per remote node. Set by the launcher."""
 
     admin_token_var: str | None = None
     """Name of the environment variable holding the admin token of the inference servers. When it is set and non-empty, engine admin requests carry it in the ``X-Prime-Admin-Token`` header."""
