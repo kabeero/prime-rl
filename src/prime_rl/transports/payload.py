@@ -193,10 +193,14 @@ def pad_token_arrays(micro_batch: MicroBatch, padding_size: int) -> None:
         micro_batch.sampler_support.replayed += bytes(padding_size)
 
 
-def payload_host(bind_address: str | None) -> tuple[str, str]:
+def payload_host(bind_address: str | None, advertise_host: str | None = None) -> tuple[str, str]:
     """The host the payload server binds and the host trainer ranks reach it at: the env
     server's own bind host (the launcher binds the node address; unset means the loopback
-    default), or for a wildcard bind, every interface and a routable address of this node."""
+    default), or for a wildcard bind, every interface and a routable address of this node.
+    With `advertise_host`, every interface and that host, which need not be an address
+    of a local interface."""
+    if advertise_host is not None:
+        return "0.0.0.0", advertise_host
     if bind_address is None:
         return "127.0.0.1", "127.0.0.1"
     host = urlparse(bind_address).hostname
@@ -375,8 +379,10 @@ def _fields(arrays: BranchArrays) -> set[str]:
 class PayloadHook:
     """`prime_rl.env.set_episode_hook` hook: keep a finished train episode's arrays."""
 
-    def __init__(self, bind_address: str | None = None, store: StoreWriter | None = None):
-        self._hosts = payload_host(bind_address)
+    def __init__(
+        self, bind_address: str | None = None, store: StoreWriter | None = None, advertise_host: str | None = None
+    ):
+        self._hosts = payload_host(bind_address, advertise_host)
         self._server: PayloadServer | StoreWriter | None = store
         self._lock = threading.Lock()
 

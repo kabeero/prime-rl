@@ -49,6 +49,17 @@ _SHUTDOWN_DRAIN_SECONDS = 5.0
 """Leave time for shared-resource teardown before the pool's 10-second kill deadline."""
 
 
+_inference_base_url: str | None = None
+
+
+def set_inference_base_url(base_url: str | None) -> None:
+    """Send every episode's model requests to `base_url` instead of the `base_url` its run
+    request carries: for a worker that reaches the inference server on another address than
+    the client that built the request."""
+    global _inference_base_url
+    _inference_base_url = base_url
+
+
 def set_episode_hook(hook: EpisodeHook | None) -> None:
     """Install a hook that keeps finished episodes' training arrays. Streamed nodes never
     carry them, so the hook is the only way they leave the worker. Every episode it
@@ -144,7 +155,10 @@ class EnvWorker:
     async def _run(self, req: RunRequest, client_id: bytes, request_id: bytes) -> RunResponse:
         # No client is built or cached here — each rollout constructs its own from
         # `req.client` and closes it, so a training run's changing model leaves nothing behind.
-        ctx = ModelContext(client=req.client, model=req.model, sampling=req.sampling)
+        client = req.client
+        if _inference_base_url is not None:
+            client = client.model_copy(update={"base_url": _inference_base_url})
+        ctx = ModelContext(client=client, model=req.model, sampling=req.sampling)
         (slot,) = self.env.slots(self._build_task(req.task_data))
 
         async def send_delta(delta: dict) -> None:

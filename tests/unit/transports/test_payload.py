@@ -340,6 +340,9 @@ def test_payload_server_binds_the_env_worker_pool_host():
     assert payload_host("tcp://10.1.2.3:0") == ("10.1.2.3", "10.1.2.3")
     bind, url = payload_host("tcp://*:5000")
     assert bind == "0.0.0.0" and not url.startswith("127.")
+    # An advertised host is published as given, and reachable on every interface.
+    assert payload_host("tcp://0.0.0.0:7000", "100.64.0.7") == ("0.0.0.0", "100.64.0.7")
+    assert payload_host("tcp://10.1.2.3:0", "100.64.0.7") == ("0.0.0.0", "100.64.0.7")
 
 
 def test_store_serves_and_deletes():

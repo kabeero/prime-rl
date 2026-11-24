@@ -11,8 +11,8 @@ from pathlib import Path
 
 from verifiers.v1.runtimes import set_base_sandbox_labels
 
-from prime_rl.configs.env_worker_pool import EnvWorkerPoolConfig
-from prime_rl.env import run_env_worker_pool, set_episode_hook
+from prime_rl.configs.env_worker_pool import EnvWorkerPoolConfig, ServeConfig
+from prime_rl.env import run_env_worker_pool, set_episode_hook, set_inference_base_url
 from prime_rl.orchestrator.utils import setup_env_worker_pool_logging
 from prime_rl.transports.payload import PayloadHook, RolloutStore, StoreWriter, payload_host
 from prime_rl.utils.config import check_mode, cli
@@ -23,13 +23,14 @@ def setup_worker(
     log_level: str | None,
     json_logging: bool,
     sandbox_labels: list[str],
-    bind_address: str | None,
+    serve: ServeConfig,
     store: StoreWriter | None,
 ) -> None:
     setup_env_worker_pool_logging(log_level, json_logging)
     set_base_sandbox_labels(sandbox_labels)
+    set_inference_base_url(serve.inference_base_url)
     # Episode streams never carry training arrays; the hook keeps them for the trainer.
-    set_episode_hook(PayloadHook(bind_address, store))
+    set_episode_hook(PayloadHook(serve.address, store, serve.advertise_host))
 
 
 def remove_dead_stores(store_dir: Path) -> None:
@@ -66,7 +67,8 @@ def run_pool(config: EnvWorkerPoolConfig):
             remove_dead_stores(config.store_dir)
             prefix = f"{socket.gethostname()}-{os.getpid()}-"
             directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix, dir=config.store_dir)))
-            store = StoreWriter(directory, RolloutStore(directory, *payload_host(config.serve.address)).url)
+            hosts = payload_host(config.serve.address, config.serve.advertise_host)
+            store = StoreWriter(directory, RolloutStore(directory, *hosts).url)
         # Apply logging, sandbox labels, and the payload hook in the broker and every worker.
         run_env_worker_pool(
             pool=config.serve.pool,
@@ -77,7 +79,7 @@ def run_pool(config: EnvWorkerPoolConfig):
                 config.log.level,
                 config.log.json_logging,
                 sandbox_labels,
-                config.serve.address,
+                config.serve,
                 store,
             ),
             config_data=config.env.model_dump(mode="json"),
